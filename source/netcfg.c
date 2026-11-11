@@ -8,8 +8,6 @@
 #include "netcfg.h"
 
 #define NET_PATH     CFG_DIR "/networks.ini"
-#define OLD_CFG      CFG_DIR "/wifi.cfg"
-#define OLD_CFG_PI   CFG_DIR "/wifi-pi.cfg"
 
 saved_net_t netcfg[NETCFG_MAX];
 int netcfg_count;
@@ -25,7 +23,7 @@ static void copy_trim(char *dst, size_t sz, const char *src)
 
 // Parses "key=value" lines; a new entry starts at every "ssid=" line.
 // Returns the number of entries read (appended to netcfg[]).
-static int parse_file(const char *path, bool first_is_default)
+static int parse_file(const char *path)
 {
     FILE *f = fopen(path, "r");
     if (!f)
@@ -52,7 +50,6 @@ static int parse_file(const char *path, bool first_is_default)
             cur = &netcfg[netcfg_count++];
             memset(cur, 0, sizeof(*cur));
             copy_trim(cur->ssid, sizeof(cur->ssid), v);
-            cur->is_default = first_is_default && added == 0;
             added++;
             continue;
         }
@@ -81,22 +78,7 @@ void netcfg_load(void)
     if (!g_sd_ok)
         return;
 
-    struct stat st;
-    if (stat(NET_PATH, &st) == 0)
-    {
-        parse_file(NET_PATH, false);
-    }
-    else
-    {
-        // First run of 0.9: import the single-network files of older versions.
-        int a = parse_file(OLD_CFG, true);
-        int b = parse_file(OLD_CFG_PI, false);
-        if (a + b > 0)
-        {
-            flog("imported %d networks from the old configuration files", a + b);
-            netcfg_save();
-        }
-    }
+    parse_file(NET_PATH);
 
     // At most one default network.
     bool seen = false;

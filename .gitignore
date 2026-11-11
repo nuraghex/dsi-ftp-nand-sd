@@ -10,3 +10,4 @@ networks.ini
 wifi*.cfg
 log.txt
 nand_backup/
+release/

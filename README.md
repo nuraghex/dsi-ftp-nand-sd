@@ -1,4 +1,6 @@
-# DSi FTP
+<p align="center"><img src="docs/logo.webp" width="160" alt="DSi FTP logo"></p>
+
+# DSi FTP — NAND + SD over Wi-Fi
 
 FTP server for the **Nintendo DSi** that exposes the SD card **and the internal NAND** over Wi-Fi (WPA2 supported). Browse and back up the system memory from a PC with Windows Explorer, FileZilla or any FTP client, without removing the SD card.
 

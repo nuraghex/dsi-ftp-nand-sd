@@ -3,8 +3,9 @@
 
 NAME		:= dsiftp
 GAME_TITLE	:= DSi FTP
-GAME_SUBTITLE	:= SD + NAND via Wi-Fi
-GAME_AUTHOR	:= homebrew
+GAME_SUBTITLE	:= NAND + SD via Wi-Fi
+GAME_AUTHOR	:= nuraghex
+GAME_ICON	:= icon.png
 
 SOURCEDIRS	:= source
 

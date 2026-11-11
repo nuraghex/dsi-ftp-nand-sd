@@ -45,7 +45,7 @@
     X(S_NAND_NOT_AVAIL,      22, LC_N,  "not available") \
     X(S_NAND_FULL_ON,        22, LC_N,  "FULL WRITE!") \
     X(S_NAND_WRITE_ON,       22, LC_N,  "WRITE ENABLED") \
-    X(S_EXPLORER,            28, LC_N,  "File Explorer:  ftp://") \
+    X(S_FTP_ADDRESS,            28, LC_N,  "Address:  ftp://") \
     X(S_USER_LABEL,           7, LC_N,  "user:") \
     X(S_CUSTOM_PASSWORD,     29, LC_N,  "custom password") \
     X(S_USER_FREE,           16, LC_N,  "user: any") \

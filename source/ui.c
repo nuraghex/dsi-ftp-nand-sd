@@ -387,8 +387,10 @@ void ui_draw_status(const ui_status_t *st)
     const char *right = full ? T(S_HDR_BRICK) : writing ? T(S_HDR_NAND_WRITE) : "v" APP_VERSION;
     ui_fill(SCR_TOP, 0, 0, W, 26, writing ? COL_RED : COL_HEADER);
     ui_text(SCR_TOP, 8, 5, "DSi FTP", COL_WHITE, 2);
+    // Author beside the name (lower line), version or warning top right
+    ui_text(SCR_TOP, 124, 14, "@" APP_AUTHOR, writing ? COL_WHITE : COL_GRAY, 1);
     ui_clip(buf, sizeof(buf), right, 16);
-    ui_text(SCR_TOP, W - 8 - ui_text_w(buf, 1), 10, buf, writing ? COL_WHITE : COL_GRAY, 1);
+    ui_text(SCR_TOP, W - 8 - ui_text_w(buf, 1), 4, buf, writing ? COL_WHITE : COL_GRAY, 1);
 
     // Status rows
     const int xl = 22, xv = 76;
@@ -432,7 +434,7 @@ void ui_draw_status(const ui_status_t *st)
             snprintf(addr, sizeof(addr), "%s:%d", st->ip, st->port);
         else
             snprintf(addr, sizeof(addr), "%s", st->ip);
-        ui_clip(buf, sizeof(buf), T(S_EXPLORER), 28);
+        ui_clip(buf, sizeof(buf), T(S_FTP_ADDRESS), 28);
         ui_text(SCR_TOP, 14, 102, buf, COL_GRAY, 1);
         // Large if it fits in the card (13 chars), small otherwise
         if (ui_text_w(addr, 2) <= W - 28)

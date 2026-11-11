@@ -8,7 +8,7 @@ The DSi FTP binary (`dsiftp.dsi`) is built with [BlocksDS](https://blocksds.skyl
 | DSWiFi (BlocksDS) | MIT | Copyright (c) 2005-2006 Stephen Stair; 2006-2018 Dave Murphy; 2021 Max Thomas; BlocksDS contributors |
 | lwIP (bundled in DSWiFi) | BSD 3-Clause | Copyright (c) 2001, 2004 Swedish Institute of Computer Science |
 | Mbed TLS (bundled in DSWiFi) | Apache-2.0 (dual-licensed Apache-2.0 OR GPL-2.0-or-later; used under Apache-2.0) | Copyright The Mbed TLS Contributors |
-| picolibc | BSD-style licences | see the picolibc COPYING files |
+| picolibc | BSD-style licences | see `licenses/picolibc/COPYING.picolibc` |
 | BlocksDS ARM7 core and crt0 | zlib / CC0 | BlocksDS contributors |
 
 The full licence texts are shipped with BlocksDS:
