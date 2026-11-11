@@ -323,6 +323,22 @@ static int path_depth(const char *vp)
     return strcmp(vp, "/") == 0 ? 0 : d;
 }
 
+// True if the path holds a name the filesystem resolves differently from how
+// it is written: FatFs drops a trailing dot or space, takes '\' as a
+// separator and ':' as a drive prefix, and '~' marks 8.3 aliases. Without
+// this check "/nand/sys./HWINFO" would slip past the protected paths.
+static bool has_ambiguous_name(const char *vp)
+{
+    for (const char *p = vp; *p; p++)
+    {
+        if (*p == '\\' || *p == ':' || *p == '~')
+            return true;
+        if ((*p == '.' || *p == ' ') && (p[1] == '/' || p[1] == '\0'))
+            return true;
+    }
+    return false;
+}
+
 // NULL if a write to vp is allowed, otherwise the reason it is refused.
 static const char *write_refusal(vkind_t k, const char *vp, const char *real)
 {
@@ -340,6 +356,9 @@ static const char *write_refusal(vkind_t k, const char *vp, const char *real)
         return "the NAND root cannot be changed";
     if (ftp_nand_full_active())
         return NULL; // EXPERIMENTAL full write: no protected paths (backups still made)
+    if (!perms.nand_loose_names && has_ambiguous_name(vp))
+        return "name not allowed on the NAND: trailing dot or space, or \\ : ~ "
+               "(nand_strict_names in settings.ini)";
     if (path_depth(vp) <= 2)
         return "the top-level NAND folders are protected";
     for (size_t i = 0; i < sizeof(protected_paths) / sizeof(protected_paths[0]); i++)
@@ -464,8 +483,18 @@ static bool backup_nand_file(const char *vp, const char *real)
     struct stat st;
     if (stat(dst, &st) == 0)
         return true;
-    if (!mkdirs(dir) || !copy_file(real, dst))
+    // Copy under a temporary name and give it the final one only when it is
+    // complete and as long as the original: an interrupted copy must never
+    // pass for a backup on the next attempt.
+    char part[sizeof(dst) + 16];
+    snprintf(part, sizeof(part), "%s.dsiftp.tmp", dst);
+    struct stat src_st, part_st;
+    bool ok = mkdirs(dir) && copy_file(real, part) && stat(real, &src_st) == 0 &&
+              stat(part, &part_st) == 0 && part_st.st_size == src_st.st_size &&
+              rename(part, dst) == 0;
+    if (!ok)
     {
+        unlink(part);
         ui_msg(S_LOG_BACKUP_FAIL, vp);
         nand_journal("backup FAILED %s (operation cancelled)", vp);
         return false;
@@ -648,7 +677,8 @@ void ftp_set_perms(const ftp_perms_t *p)
     if (w != old_w || f != old_f)
     {
         ui_msg(f ? S_LOG_NAND_FULL_ON : w ? S_LOG_NAND_W_ON : S_LOG_NAND_RO);
-        nand_journal("permissions: writing %s", f ? "FULL (experimental)" : w ? "protected" : "off");
+        nand_journal("permissions: writing %s%s", f ? "FULL (experimental)" : w ? "protected" : "off",
+                     w && !f && perms.nand_loose_names ? " (strict names OFF)" : "");
     }
 }
 
@@ -885,6 +915,15 @@ static void cmd_stor(session_t *s, const char *arg, bool append)
         reply(s, "553 Invalid path");
         return;
     }
+    // REST is only honoured by RETR. A resumed STOR would replace the file
+    // with just its tail, so it is refused; APPE simply appends.
+    long long rest = s->rest;
+    s->rest = 0;
+    if (rest > 0 && !append)
+    {
+        reply(s, "554 Resuming an upload is not supported: send the whole file");
+        return;
+    }
     vkind_t k = vpath_to_real(vp, real, sizeof(real));
     const char *why = write_refusal(k, vp, real);
     if (why)
@@ -920,21 +959,21 @@ static void cmd_stor(session_t *s, const char *arg, bool append)
         target = tmp;
     }
 
-    FILE *f = fopen(target, append ? "ab" : "wb");
-    if (!f)
-    {
-        reply(s, "550 Cannot create the file");
-        return;
-    }
-
     reply(s, "150 Receiving %s", base_name(vp));
     int dfd = accept_data(s);
     if (dfd < 0)
     {
-        fclose(f);
-        if (on_nand)
-            unlink(tmp);
         reply(s, "425 Data connection failed");
+        return;
+    }
+
+    // The file is created (and an existing one truncated) only now that the
+    // data connection is up: a blocked passive port must not empty it.
+    FILE *f = fopen(target, append ? "ab" : "wb");
+    if (!f)
+    {
+        sock_close(&dfd);
+        reply(s, "553 Cannot create the file");
         return;
     }
 
@@ -971,11 +1010,13 @@ static void cmd_stor(session_t *s, const char *arg, bool append)
 
     if (on_nand)
     {
+        bool stranded = false; // original left under its .old name
         if (ok)
         {
-            // Swap in the new file without a moment where it's missing:
-            // original -> .old, temporary -> original name, delete .old.
-            // The original is also backed up on the SD.
+            // Swap in the new file: original -> .old, temporary -> original
+            // name, delete .old. FAT cannot rename over an existing file, so
+            // between the two renames the name is briefly missing; the
+            // original then survives as .old and in the SD backup.
             if (type == 0)
             {
                 char old[RPATH_LEN + 16];
@@ -989,7 +1030,10 @@ static void cmd_stor(session_t *s, const char *arg, bool append)
                 {
                     ok = false;
                     if (rename(old, real) != 0)
+                    {
+                        stranded = true;
                         ui_msg(S_LOG_RESTORE_WARN, vp);
+                    }
                 }
                 else
                 {
@@ -1002,9 +1046,13 @@ static void cmd_stor(session_t *s, const char *arg, bool append)
             }
         }
         if (!ok)
-            unlink(tmp); // the original file (if any) is untouched
+            unlink(tmp);
         ui_msg(ok ? S_LOG_NAND_WRITTEN : S_LOG_NAND_NOT_WRITTEN, vp);
-        nand_journal("write %s %s", vp, ok ? "ok" : "FAILED (original intact)");
+        nand_journal("write %s %s", vp,
+                     ok ? "ok"
+                     : stranded ? "FAILED: original NOT in place, it is now <name>.dsiftp.old "
+                                  "(also in this backup folder)"
+                     : type == 0 ? "FAILED (original intact)" : "FAILED (nothing written)");
     }
 
     if (ok)

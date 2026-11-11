@@ -14,6 +14,9 @@
 //   file is backed up to the SD before being overwritten or deleted.
 // - nand_full (EXPERIMENTAL, untested): no protected paths at all. Backups
 //   are still made.
+// - nand_loose_names: turns off the check that refuses NAND names the
+//   filesystem would resolve differently (trailing dot or space, \ : ~).
+//   Off by default; with it on, such names can reach the protected paths.
 //
 // The caller is responsible for nand_WriteProtect() (driver level).
 typedef struct {
@@ -22,6 +25,7 @@ typedef struct {
     bool nand_read;
     bool nand_write;
     bool nand_full;
+    bool nand_loose_names;
 } ftp_perms_t;
 
 // Tells the server whether the NAND is mounted, before any permission is set.

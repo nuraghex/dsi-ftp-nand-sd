@@ -38,6 +38,7 @@ Writing to the NAND can **brick** the console with no software recovery. For thi
 
 - NAND writing is **off at every start** and can only be enabled **on the DSi itself** (Permissions menu, hold L+R and press A), never from the PC.
 - Even with writing enabled these stay read-only: the launcher and Unlaunch, `sys/`, `shared1/`, system titles, DSi FTP itself and the top-level folders.
+- Names the filesystem would read differently from how they are written (ending in a dot or a space, or containing `\`, `:` or `~`) are refused on the NAND, so they cannot be used to reach a protected path. If you ever need such a name, set `nand_strict_names=0` in `settings.ini`.
 - Every file is copied to `_nds/dsiftp/nand_backup/` before it is changed or deleted, and every operation is written to `nand_backup/journal.txt`. Files are replaced through a temporary copy, so an interrupted upload leaves the original intact.
 - Writing needs the charger or a battery level of at least 8/15, and is switched off automatically below 4/15.
 

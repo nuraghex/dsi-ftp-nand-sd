@@ -177,6 +177,8 @@ static void settings_load(void)
                 p.sd_write = on;
             else if (strcmp(line, "nand_read") == 0)
                 p.nand_read = on;
+            else if (strcmp(line, "nand_strict_names") == 0)
+                p.nand_loose_names = (v[0] == '0'); // only an explicit 0 turns it off
             else if (strcmp(line, "ftp_custom") == 0)
                 ftp_custom = on;
             else if (strcmp(line, "ftp_user") == 0)
@@ -220,8 +222,8 @@ static void settings_save(void)
     FILE *f = fopen(SETTINGS_PATH, "w");
     if (!f)
         return;
-    fprintf(f, "log=%d\nsd_read=%d\nsd_write=%d\nnand_read=%d\n", g_log, p->sd_read, p->sd_write,
-            p->nand_read);
+    fprintf(f, "log=%d\nsd_read=%d\nsd_write=%d\nnand_read=%d\nnand_strict_names=%d\n", g_log,
+            p->sd_read, p->sd_write, p->nand_read, !p->nand_loose_names);
     // The custom FTP password is stored in plain text, like the Wi-Fi ones.
     fprintf(f, "ftp_custom=%d\nftp_user=%s\nftp_pass=%s\nftp_port=%d\n", ftp_custom, ftp_user,
             ftp_pass, ftp_port);
