@@ -1,0 +1,12 @@
+build/
+*.nds
+*.dsi
+*.elf
+*.map
+*.dump
+compile_commands.json
+# never commit configuration or logs copied from a DSi SD card
+networks.ini
+wifi*.cfg
+log.txt
+nand_backup/
