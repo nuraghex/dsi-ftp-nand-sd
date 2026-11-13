@@ -59,6 +59,7 @@ Writing to the NAND can **brick** the console with no software recovery. For thi
 | Windows Explorer and FileZilla | running as a title installed to the DSi Menu |
 | protected NAND write: refusals, write, overwrite, delete | writing in full NAND write mode |
 | all 8 interface languages, full write mode activation | |
+| repeated 4 MB and 16 MB transfers, checked with SHA-256 (about 600 KB/s down, 350 KB/s up) | |
 
 **Known issue:** on some start-ups the first association stays stuck in the Wi-Fi library. The app retries up to 3 times; if it still fails, switch the DSi off and on.
 
