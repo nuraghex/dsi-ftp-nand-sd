@@ -21,6 +21,10 @@ ARM7ELF		:= $(BLOCKSDS)/sys/arm7/main_core/arm7_dswifi.elf
 endif
 
 LIBS		:= -ldswifi9 -lnds9
+
+# sdlock.c intercepts these to keep Wi-Fi transmissions away from SD/NAND requests.
+LDFLAGS		:= -Wl,--wrap=fifoMutexAcquire -Wl,--wrap=fifoMutexRelease \
+		   -Wl,--wrap=Wifi_TransmitFunctionLink
 LIBDIRS		:= $(BLOCKSDS)/libs/dswifi
 
 
