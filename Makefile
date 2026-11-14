@@ -20,6 +20,11 @@ else
 ARM7ELF		:= $(BLOCKSDS)/sys/arm7/main_core/arm7_dswifi.elf
 endif
 
+# TUNING=1 adds the XWAIT command (speed experiments only, never in releases).
+ifeq ($(TUNING),1)
+DEFINES		+= -DDSIFTP_TUNING
+endif
+
 LIBS		:= -ldswifi9 -lnds9
 
 # sdlock.c intercepts these to keep Wi-Fi transmissions away from SD/NAND requests.

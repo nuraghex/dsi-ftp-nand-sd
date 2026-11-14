@@ -1,0 +1,344 @@
+diff --git a/source/arm7/twl/ath/htc.twl.c b/source/arm7/twl/ath/htc.twl.c
+index c990f43..df8b824 100644
+--- a/source/arm7/twl/ath/htc.twl.c
++++ b/source/arm7/twl/ath/htc.twl.c
+@@ -24,10 +24,18 @@ void htc_handle_pkt(u16 pkt_cmd, u8 *pkt_data, u32 len, u32 ack_len)
+     {
+         case HTC_MSG_READY:
+         {
+-            WLOG_PRINTF("T: HTC_MSG_READY (%u B) 0x%x\n", (unsigned int)len,
+-                        (unsigned int)ack_len);
++            u16 cred_count = 0, cred_size = 0;
++            if (len >= 4)
++            {
++                cred_count = pkt_data[0] | (pkt_data[1] << 8);
++                cred_size = pkt_data[2] | (pkt_data[3] << 8);
++            }
++            WLOG_PRINTF("T: HTC_MSG_READY (%u B) 0x%x: %u credits of %u B\n",
++                        (unsigned int)len, (unsigned int)ack_len, cred_count, cred_size);
+             WLOG_FLUSH();
+ 
++            wifi_card_htc_credits_init(cred_count, cred_size);
++
+             const u8 wmi_handshake_1[6] = { 0x0, 0x1, 0x0, 0, 0, 0 };
+             const u8 wmi_handshake_2[6] = { 0x1, 0x1, 0x5, 0, 0, 0 };
+             const u8 wmi_handshake_3[6] = { 0x2, 0x1, 0x5, 0, 0, 0 };
+diff --git a/source/arm7/twl/card.h b/source/arm7/twl/card.h
+index 67ebf31..fff09fb 100644
+--- a/source/arm7/twl/card.h
++++ b/source/arm7/twl/card.h
+@@ -62,6 +62,9 @@ void wifi_card_write_intern_word(u32 addr, u32 data);
+ void wifi_card_mbox0_send_packet(u8 type, u8 ack_type, const u8* data, u16 len, u16 idk);
+ u16 wifi_card_mbox0_readpkt(void);
+ 
++void wifi_card_htc_credits_init(u16 count, u16 size);
++bool wifi_card_tx_credits_ok(u32 len);
++
+ void data_send_pkt_idk(const u8 *pkt_data, u32 len);
+ void data_send_pkt(const u8 *pkt_data, u32 len);
+ void data_send_test(const u8* dst_bssid, const u8* src_bssid, u16 idk);
+diff --git a/source/arm7/twl/card.twl.c b/source/arm7/twl/card.twl.c
+index 864cf14..4c5b5b7 100644
+--- a/source/arm7/twl/card.twl.c
++++ b/source/arm7/twl/card.twl.c
+@@ -15,7 +15,9 @@
+ #include "arm7/debug.h"
+ #include "arm7/twl/card.h"
+ #include "arm7/twl/ndma.h"
++#include "arm7/ipc.h"
+ #include "arm7/twl/rx_queue.h"
++#include "arm7/twl/tx_queue.h"
+ #include "arm7/twl/utils.h"
+ #include "arm7/twl/update.h"
+ #include "arm7/twl/ath/wmi.h"
+@@ -492,6 +494,125 @@ static bool wifi_card_read_mbox0_u32_timeout(u32* retv, u32 timeout_max)
+     return true;
+ }
+ 
++// HTC credit flow control
++// =======================
++//
++// The target has a fixed number of TX buffers ("credits"). It says how many
++// there are, and their size, in HTC_MSG_READY, and it reports the ones it has
++// freed in the trailer of the packets it sends to the host. Sending a packet
++// when there are no credits left overflows the mailbox of the target, so the
++// packets that come from the ARM9 wait in the TX queue until there are credits.
++
++#define HTC_HDR_SIZE        6
++#define HTC_CRED_RESERVE    1 // Credits that data never uses: kept for WMI
++#define HTC_CRED_STALL_MAX  4 // Frames without credits before sending anyway
++
++static u16 htc_cred_total = 0;
++static u16 htc_cred_size = 0; // 0 = not known yet: no flow control
++static s32 htc_cred_avail = 0;
++static u32 htc_cred_stall_frames = 0;
++static u32 htc_cred_last_line = 0;
++static u32 htc_cred_stat_defer = 0;
++static u32 htc_cred_stat_force = 0;
++
++void wifi_card_htc_credits_init(u16 count, u16 size)
++{
++    // With too few credits the reserve would never let data through
++    if (count < 4 || size < 256)
++    {
++        htc_cred_size = 0;
++        return;
++    }
++
++    htc_cred_total = count;
++    htc_cred_size = size;
++    htc_cred_avail = count;
++    htc_cred_stall_frames = 0;
++}
++
++static s32 htc_credits_for(u32 len)
++{
++    return (len + HTC_HDR_SIZE + htc_cred_size - 1) / htc_cred_size;
++}
++
++static void htc_credits_consume(u32 len)
++{
++    if (htc_cred_size == 0)
++        return;
++
++    htc_cred_avail -= htc_credits_for(len);
++    if (htc_cred_avail < 0)
++        htc_cred_avail = 0;
++}
++
++static void htc_credits_return(u32 count)
++{
++    if (htc_cred_size == 0)
++        return;
++
++    htc_cred_avail += count;
++    if (htc_cred_avail > htc_cred_total)
++        htc_cred_avail = htc_cred_total;
++
++    htc_cred_stall_frames = 0;
++}
++
++// True if the packet that follows a data packet of this size would have to
++// wait: the target is then asked to report its free credits right away.
++static bool htc_credits_low(u32 len)
++{
++    if (htc_cred_size == 0)
++        return false;
++
++    return htc_cred_avail < (2 * htc_credits_for(len) + HTC_CRED_RESERVE);
++}
++
++// Returns true if a data packet of this size can be sent now.
++bool wifi_card_tx_credits_ok(u32 len)
++{
++    if (htc_cred_size == 0)
++        return true;
++
++    if (htc_cred_avail >= (htc_credits_for(len) + HTC_CRED_RESERVE))
++    {
++        htc_cred_stall_frames = 0;
++        return true;
++    }
++
++    // Count the frames spent waiting. This is called at least once per frame,
++    // from the VBL handler, always in the same line: the same line or an
++    // earlier one than the last time means that a new frame has started.
++    u32 line = REG_VCOUNT;
++    if (line <= htc_cred_last_line)
++        htc_cred_stall_frames++;
++    htc_cred_last_line = line;
++
++    // If the count of credits is ever wrong (a lost report, for example) the
++    // queue must not stay blocked forever. Send one packet anyway, like the
++    // driver did before it counted credits.
++    if (htc_cred_stall_frames >= HTC_CRED_STALL_MAX)
++    {
++        htc_cred_stall_frames = 0;
++        htc_cred_stat_force++;
++        if ((htc_cred_stat_force & (htc_cred_stat_force - 1)) == 0)
++        {
++            WLOG_PRINTF("T: TX forced, no credits (%u)\n",
++                        (unsigned int)htc_cred_stat_force);
++            WLOG_FLUSH();
++        }
++        return true;
++    }
++
++    htc_cred_stat_defer++;
++    if ((htc_cred_stat_defer & (htc_cred_stat_defer - 1)) == 0)
++    {
++        WLOG_PRINTF("T: TX waits for credits (%u)\n",
++                    (unsigned int)htc_cred_stat_defer);
++        WLOG_FLUSH();
++    }
++    return false;
++}
++
+ // TODO: Move this to block transfers.
+ // This could get tricky since we'd be unable to failsafe on TX overflows.
+ // Maybe it would be better to make a DMA330 driver specifically
+@@ -538,6 +659,8 @@ void wifi_card_mbox0_send_packet(u8 type, u8 ack_type, const u8* data, u16 len,
+     if (len > (MBOX_TMPBUF_SIZE - 0x6))
+         len = (MBOX_TMPBUF_SIZE - 0x6);
+ 
++    htc_credits_consume(len);
++
+     if (data)
+         memcpy(&mbox_out_buffer[6], data, len);
+ 
+@@ -615,7 +738,8 @@ void data_send_pkt_idk(const u8 *pkt_data, u32 len)
+ {
+     int lock = enterCriticalSection();
+     // 0x2008 causes broadcast packets? and might be faster?
+-    wifi_card_mbox0_send_packet(0x02, MBOXPKT_NOACK, pkt_data, len, 0x2008);
++    u8 flags = htc_credits_low(len) ? MBOXPKT_REQACK : MBOXPKT_NOACK;
++    wifi_card_mbox0_send_packet(0x02, flags, pkt_data, len, 0x2008);
+     leaveCriticalSection(lock);
+ }
+ 
+@@ -789,7 +913,8 @@ u16 wifi_card_mbox0_readpkt(void)
+     }
+     else if (pkt_type == 2 || pkt_type == 3 || pkt_type == 4 || pkt_type == 5) // one of my routers sends 0x04 for some reason
+     {
+-        data_handle_pkt(pkt_data - 2, len_pkt);
++        if (len_pkt >= 16) // Smallest data packet that can be valid
++            data_handle_pkt(pkt_data - 2, len_pkt);
+     }
+     else
+     {
+@@ -816,6 +941,13 @@ u16 wifi_card_mbox0_readpkt(void)
+         //     WLOG_FLUSH();
+         // }
+ 
++        // Credit report: pairs of (endpoint, credits)
++        if (type == 1)
++        {
++            for (u16 i = 0; (i + 1) < len_ && (ack_idx + i + 1) < ack_len; i += 2)
++                htc_credits_return(ack_data[ack_idx + i + 1]);
++        }
++
+         // Lookahead item
+         if (type == 2 && len_ == 6 && !mbox_has_lookahead)
+         {
+@@ -1095,6 +1227,10 @@ static void wifi_card_irq(void)
+ 
+     wifi_card_process_pkts();
+ 
++    // The packets may have brought credits: send what was waiting for them
++    if ((WifiData != NULL) && (WifiData->flags7 & WFLAG_ARM7_ACTIVE))
++        Wifi_TWL_TxArm9QueueFlush();
++
+     //wmi_tick(); // TODO
+ }
+ 
+diff --git a/source/arm7/twl/tx_queue.twl.c b/source/arm7/twl/tx_queue.twl.c
+index ba8fcb3..45abd30 100644
+--- a/source/arm7/twl/tx_queue.twl.c
++++ b/source/arm7/twl/tx_queue.twl.c
+@@ -10,8 +10,17 @@ void Wifi_TWL_TxArm9QueueFlush(void)
+ {
+     const u8 *txbufData = (const u8 *)WifiData->txbufData;
+ 
++    static volatile bool flushing = false;
++
+     int oldIME = enterCriticalSection();
+ 
++    if (flushing)
++    {
++        leaveCriticalSection(oldIME);
++        return;
++    }
++    flushing = true;
++
+     u32 read_idx = WifiData->txbufRead;
+ 
+     assert((read_idx & 3) == 0);
+@@ -32,6 +41,10 @@ void Wifi_TWL_TxArm9QueueFlush(void)
+             if (size == 0)
+                 break;
+         }
++        // Leave it in the queue until the target has room for it
++        if (!wifi_card_tx_credits_ok(size))
++            break;
++
+         read_idx += sizeof(uint32_t);
+ 
+         // Read packet data
+@@ -47,5 +60,7 @@ void Wifi_TWL_TxArm9QueueFlush(void)
+         WifiData->stats[WSTAT_TXDATABYTES] += size;
+     }
+ 
++    flushing = false;
++
+     leaveCriticalSection(oldIME);
+ }
+diff --git a/source/arm9/lwip/include/lwipopts.h b/source/arm9/lwip/include/lwipopts.h
+index a2c4f7e..7287a04 100644
+--- a/source/arm9/lwip/include/lwipopts.h
++++ b/source/arm9/lwip/include/lwipopts.h
+@@ -110,7 +110,7 @@
+ 
+ #define LWIP_RAW                    1
+ 
+-#define TCP_WND                     (4 * TCP_MSS)
++#define TCP_WND                     (16 * TCP_MSS)
+ #define TCP_MSS                     1460
+ #define TCP_SND_BUF                 (8 * TCP_MSS)
+ #define TCP_LISTEN_BACKLOG          1
+@@ -157,10 +157,10 @@
+ #define TCPIP_THREAD_STACKSIZE      4096
+ 
+ // Sizes of all mailboxes
+-#define TCPIP_MBOX_SIZE             10
++#define TCPIP_MBOX_SIZE             48
+ #define DEFAULT_RAW_RECVMBOX_SIZE   10
+ #define DEFAULT_UDP_RECVMBOX_SIZE   10
+-#define DEFAULT_TCP_RECVMBOX_SIZE   10
++#define DEFAULT_TCP_RECVMBOX_SIZE   32
+ #define DEFAULT_ACCEPTMBOX_SIZE     10
+ 
+ // Disable statistics
+diff --git a/source/arm9/lwip/sys.c b/source/arm9/lwip/sys.c
+index 99c1261..ecd8191 100644
+--- a/source/arm9/lwip/sys.c
++++ b/source/arm9/lwip/sys.c
+@@ -120,7 +120,7 @@ void sys_arch_unprotect(sys_prot_t pval)
+ 
+ // ============================================================================
+ 
+-#define MBOX_NUMBER 10
++#define MBOX_NUMBER 32
+ #define MBOX_MAGIC  0xB10C4500 // Leave the low byte empty to fit an index
+ 
+ typedef struct
+@@ -176,7 +176,7 @@ static sys_mbox_internal *get_mbox(sys_mbox_t value)
+     if (magic != MBOX_MAGIC)
+         return NULL;
+ 
+-    if (index > MBOX_NUMBER)
++    if (index >= MBOX_NUMBER)
+         return NULL;
+ 
+     return dswifi_mbox[index];
+@@ -321,7 +321,7 @@ void sys_mbox_free(sys_mbox_t *mbox)
+     if (magic != MBOX_MAGIC)
+         return;
+ 
+-    if (index > MBOX_NUMBER)
++    if (index >= MBOX_NUMBER)
+         return;
+ 
+     int oldIME = enterCriticalSection();
+diff --git a/source/common/wifi_shared.h b/source/common/wifi_shared.h
+index af95412..c94d123 100644
+--- a/source/common/wifi_shared.h
++++ b/source/common/wifi_shared.h
+@@ -13,7 +13,7 @@
+ #include <dswifi_common.h>
+ 
+ // Space reserved for incoming and outgoing packets
+-#define WIFI_RXBUFFER_SIZE  (1024 * 12)
++#define WIFI_RXBUFFER_SIZE  (1024 * 64)
+ #define WIFI_TXBUFFER_SIZE  (1024 * 24)
+ 
+ // Value written in RX/TX buffers to restart the pointer to the beginning

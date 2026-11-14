@@ -105,22 +105,65 @@ static void sock_close(int *fd)
     }
 }
 
+// Ends a session. Always both sockets: a passive socket left open here is
+// lost when the slot is reused, and lwIP only has 8 sockets (four clients
+// that asked for PASV and then just quit used to block every transfer).
+static void session_close(session_t *s)
+{
+    sock_close(&s->pasv);
+    sock_close(&s->ctrl);
+}
+
 static bool would_block(int ret)
 {
     return ret < 0 && (errno == EWOULDBLOCK || errno == EAGAIN);
 }
 
 // Waits a little: yields to other work and, every few calls, to the next frame.
+//
+// The sleep lets only one send buffer through per frame (about 700 KB/s with
+// DSWiFi's 11680 bytes), but it must stay: sending faster freezes the console.
+// Measured on 2026-11-13 with BlocksDS 1.25: 256 quick retries gain nothing,
+// 1024 froze a download after 7 MB, never sleeping after 1 MB.
+#ifdef DSIFTP_TUNING
+// Test builds only (make TUNING=1): the XWAIT command changes the number of
+// quick retries, to try a faster send side against a modified DSWiFi.
+static int wait_spins = 64;
+#else
+#define wait_spins 64
+#endif
+
 static void wait_a_bit(int *spins, int *frames)
 {
     net_yield();
-    if (++(*spins) >= 64)
+    if (++(*spins) >= wait_spins)
     {
         *spins = 0;
         // Never swiWaitForVBlank() here: it doesn't let the lwIP cothread run.
         cothread_yield_irq(IRQ_VBLANK);
         (*frames)++;
     }
+}
+
+// The same for a receive loop, where the sleep is not needed: here it only
+// halves the speed (one 5840-byte TCP window per frame, about 350 KB/s), and
+// receiving without it was stable in the same tests. So this keeps yielding to
+// the lwIP cothreads and sleeps, a frame at a time, only after RX_BUSY_FRAMES
+// without data. *line holds the screen line seen by the last call.
+#define RX_BUSY_FRAMES 30
+static void wait_rx(int *line, int *frames)
+{
+    if (*frames >= RX_BUSY_FRAMES)
+    {
+        cothread_yield_irq(IRQ_VBLANK);
+        (*frames)++;
+        return;
+    }
+    net_yield();
+    int now = REG_VCOUNT;
+    if (now < *line) // the line counter wrapped: a new frame has started
+        (*frames)++;
+    *line = now;
 }
 
 static bool send_all(int fd, const void *data, size_t len)
@@ -162,7 +205,7 @@ static void reply(session_t *s, const char *fmt, ...)
     buf[n++] = '\r';
     buf[n++] = '\n';
     if (!send_all(s->ctrl, buf, n))
-        sock_close(&s->ctrl);
+        session_close(s);
 }
 
 // ---------------------------------------------------------------------------
@@ -631,8 +674,7 @@ void ftp_disconnect_all(void)
         {
             const char *bye = "421 Disconnected by the DSi\r\n";
             send(sess[i].ctrl, bye, strlen(bye), 0);
-            sock_close(&sess[i].pasv);
-            sock_close(&sess[i].ctrl);
+            session_close(&sess[i]);
         }
     }
     ui_msg(S_LOG_CLIENTS_KICKED);
@@ -845,12 +887,81 @@ static bool send_listing(session_t *s, int dfd, vkind_t k, const char *vp,
 // Transfers
 // ---------------------------------------------------------------------------
 
+// Speed test: a transfer from or to this name, in any folder, never touches
+// the SD or the NAND, so it measures the Wi-Fi link alone. For example:
+//   curl -o NUL ftp://USER:PASS@IP/.dsiftp-speedtest        (download)
+//   curl -T bigfile ftp://USER:PASS@IP/.dsiftp-speedtest    (upload)
+#define BENCH_NAME  ".dsiftp-speedtest"
+#define BENCH_BYTES (32u * 1024 * 1024)
+
+static bool is_bench(const char *vp)
+{
+    return strcmp(base_name(vp), BENCH_NAME) == 0;
+}
+
+static void bench_retr(session_t *s)
+{
+    s->rest = 0;
+    reply(s, "150 Speed test: sending %u bytes", (unsigned)BENCH_BYTES);
+    int dfd = accept_data(s);
+    if (dfd < 0)
+    {
+        reply(s, "425 Data connection failed");
+        return;
+    }
+    memset(xbuf, 0, XFER_BUF_SIZE);
+    bool ok = true;
+    for (size_t left = BENCH_BYTES; ok && left > 0; left -= XFER_BUF_SIZE)
+        ok = send_all(dfd, xbuf, XFER_BUF_SIZE);
+    sock_close(&dfd);
+    reply(s, ok ? "226 Transfer complete" : "426 Transfer aborted");
+}
+
+static void bench_stor(session_t *s)
+{
+    s->rest = 0;
+    reply(s, "150 Speed test: the data is discarded");
+    int dfd = accept_data(s);
+    if (dfd < 0)
+    {
+        reply(s, "425 Data connection failed");
+        return;
+    }
+    bool ok = true;
+    int spins = 0, frames = 0;
+    for (;;)
+    {
+        int n = recv(dfd, xbuf, XFER_BUF_SIZE, 0);
+        if (n > 0)
+        {
+            spins = frames = 0;
+            continue;
+        }
+        if (n == 0)
+            break;
+        if (would_block(n) && frames < IDLE_TIMEOUT_FRAMES)
+        {
+            wait_rx(&spins, &frames);
+            continue;
+        }
+        ok = false;
+        break;
+    }
+    sock_close(&dfd);
+    reply(s, ok ? "226 Speed test done" : "426 Transfer aborted");
+}
+
 static void cmd_retr(session_t *s, const char *arg)
 {
     char vp[VPATH_LEN], real[RPATH_LEN];
     if (!vpath_resolve(s->cwd, arg, vp, sizeof(vp)))
     {
         reply(s, "553 Invalid path");
+        return;
+    }
+    if (is_bench(vp))
+    {
+        bench_retr(s);
         return;
     }
     vkind_t k = vpath_to_real(vp, real, sizeof(real));
@@ -913,6 +1024,11 @@ static void cmd_stor(session_t *s, const char *arg, bool append)
     if (!vpath_resolve(s->cwd, arg, vp, sizeof(vp)))
     {
         reply(s, "553 Invalid path");
+        return;
+    }
+    if (is_bench(vp))
+    {
+        bench_stor(s);
         return;
     }
     // REST is only honoured by RETR. A resumed STOR would replace the file
@@ -979,18 +1095,28 @@ static void cmd_stor(session_t *s, const char *arg, bool append)
 
     if (on_nand)
         ui_msg(S_LOG_NAND_WRITING, vp);
-    bool ok = true;
+    // recv() hands over a few KB at a time (lwIP's TCP window). Writing each
+    // piece on its own means many small, unaligned storage requests, and the
+    // Wi-Fi cannot acknowledge anything while one is running (see sdlock.c):
+    // collect a full buffer first.
+    bool ok = true, wr_ok = true;
+    size_t fill = 0;
     int spins = 0, frames = 0;
     for (;;)
     {
-        int n = recv(dfd, xbuf, XFER_BUF_SIZE, 0);
+        int n = recv(dfd, xbuf + fill, XFER_BUF_SIZE - fill, 0);
         if (n > 0)
         {
             spins = frames = 0;
-            if (fwrite(xbuf, 1, n, f) != (size_t)n)
+            fill += n;
+            if (fill == XFER_BUF_SIZE)
             {
-                ok = false;
-                break;
+                fill = 0;
+                if (fwrite(xbuf, 1, XFER_BUF_SIZE, f) != XFER_BUF_SIZE)
+                {
+                    ok = wr_ok = false;
+                    break;
+                }
             }
             continue;
         }
@@ -998,12 +1124,15 @@ static void cmd_stor(session_t *s, const char *arg, bool append)
             break; // client closed: upload finished
         if (would_block(n) && frames < IDLE_TIMEOUT_FRAMES)
         {
-            wait_a_bit(&spins, &frames);
+            wait_rx(&spins, &frames);
             continue;
         }
         ok = false;
         break;
     }
+    // What is left in the buffer is valid data even if the transfer broke off.
+    if (wr_ok && fill > 0 && fwrite(xbuf, 1, fill, f) != fill)
+        ok = false;
     if (fclose(f) != 0)
         ok = false;
     sock_close(&dfd);
@@ -1195,14 +1324,14 @@ static void handle_command(session_t *s, char *line)
                 ui_msg(S_LOG_IP_BLOCKED, ip_str(s->peer), lock_cfg.seconds);
             reply(s, login_is_pin ? "530 Wrong PIN" : "530 Wrong user or password");
             if (s->fails >= MAX_LOGIN_FAILS)
-                sock_close(&s->ctrl);
+                session_close(s);
         }
         return;
     }
     if (strcmp(cmd, "QUIT") == 0)
     {
         reply(s, "221 Goodbye");
-        sock_close(&s->ctrl);
+        session_close(s);
         return;
     }
     if (strcmp(cmd, "SYST") == 0)
@@ -1313,11 +1442,28 @@ static void handle_command(session_t *s, char *line)
             s->rest = 0;
         reply(s, "350 Restarting at %lld", s->rest);
     }
+#ifdef DSIFTP_TUNING
+    else if (strcmp(cmd, "XWAIT") == 0)
+    {
+        int v = atoi(arg);
+        wait_spins = (v >= 1 && v <= 1000000) ? v : 64;
+        reply(s, "200 Quick retries before sleeping: %d", wait_spins);
+    }
+#endif
     else if (strcmp(cmd, "SIZE") == 0 || strcmp(cmd, "MDTM") == 0)
     {
         struct stat st;
-        if (!vpath_resolve(s->cwd, arg, vp, sizeof(vp)) ||
-            path_type(vpath_to_real(vp, real, sizeof(real)), real, &st) != 0)
+        if (!vpath_resolve(s->cwd, arg, vp, sizeof(vp)))
+        {
+            reply(s, "550 File not found");
+            return;
+        }
+        if (cmd[0] == 'S' && is_bench(vp)) // curl gives up if SIZE fails
+        {
+            reply(s, "213 %u", (unsigned)BENCH_BYTES);
+            return;
+        }
+        if (path_type(vpath_to_real(vp, real, sizeof(real)), real, &st) != 0)
         {
             reply(s, "550 File not found");
             return;
@@ -1559,8 +1705,7 @@ static void poll_session(session_t *s)
         if (n == 0 || (n < 0 && !would_block(n)))
         {
             ui_msg(S_LOG_CLIENT_GONE);
-            sock_close(&s->pasv);
-            sock_close(&s->ctrl);
+            session_close(s);
             return;
         }
         if (n < 0)
@@ -1612,8 +1757,7 @@ void ftp_shutdown(void)
             const char *bye = "421 Server stopped\r\n";
             send(sess[i].ctrl, bye, strlen(bye), 0);
         }
-        sock_close(&sess[i].pasv);
-        sock_close(&sess[i].ctrl);
+        session_close(&sess[i]);
     }
     sock_close(&listen_fd);
 }

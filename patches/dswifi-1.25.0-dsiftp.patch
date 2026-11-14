@@ -1,0 +1,84 @@
+diff --git a/source/arm7/twl/card.twl.c b/source/arm7/twl/card.twl.c
+index 864cf14..a164014 100644
+--- a/source/arm7/twl/card.twl.c
++++ b/source/arm7/twl/card.twl.c
+@@ -789,7 +789,8 @@ u16 wifi_card_mbox0_readpkt(void)
+     }
+     else if (pkt_type == 2 || pkt_type == 3 || pkt_type == 4 || pkt_type == 5) // one of my routers sends 0x04 for some reason
+     {
+-        data_handle_pkt(pkt_data - 2, len_pkt);
++        if (len_pkt >= 16) // Smallest data packet that can be valid
++            data_handle_pkt(pkt_data - 2, len_pkt);
+     }
+     else
+     {
+diff --git a/source/arm9/lwip/include/lwipopts.h b/source/arm9/lwip/include/lwipopts.h
+index a2c4f7e..7287a04 100644
+--- a/source/arm9/lwip/include/lwipopts.h
++++ b/source/arm9/lwip/include/lwipopts.h
+@@ -110,7 +110,7 @@
+ 
+ #define LWIP_RAW                    1
+ 
+-#define TCP_WND                     (4 * TCP_MSS)
++#define TCP_WND                     (16 * TCP_MSS)
+ #define TCP_MSS                     1460
+ #define TCP_SND_BUF                 (8 * TCP_MSS)
+ #define TCP_LISTEN_BACKLOG          1
+@@ -157,10 +157,10 @@
+ #define TCPIP_THREAD_STACKSIZE      4096
+ 
+ // Sizes of all mailboxes
+-#define TCPIP_MBOX_SIZE             10
++#define TCPIP_MBOX_SIZE             48
+ #define DEFAULT_RAW_RECVMBOX_SIZE   10
+ #define DEFAULT_UDP_RECVMBOX_SIZE   10
+-#define DEFAULT_TCP_RECVMBOX_SIZE   10
++#define DEFAULT_TCP_RECVMBOX_SIZE   32
+ #define DEFAULT_ACCEPTMBOX_SIZE     10
+ 
+ // Disable statistics
+diff --git a/source/arm9/lwip/sys.c b/source/arm9/lwip/sys.c
+index 99c1261..ecd8191 100644
+--- a/source/arm9/lwip/sys.c
++++ b/source/arm9/lwip/sys.c
+@@ -120,7 +120,7 @@ void sys_arch_unprotect(sys_prot_t pval)
+ 
+ // ============================================================================
+ 
+-#define MBOX_NUMBER 10
++#define MBOX_NUMBER 32
+ #define MBOX_MAGIC  0xB10C4500 // Leave the low byte empty to fit an index
+ 
+ typedef struct
+@@ -176,7 +176,7 @@ static sys_mbox_internal *get_mbox(sys_mbox_t value)
+     if (magic != MBOX_MAGIC)
+         return NULL;
+ 
+-    if (index > MBOX_NUMBER)
++    if (index >= MBOX_NUMBER)
+         return NULL;
+ 
+     return dswifi_mbox[index];
+@@ -321,7 +321,7 @@ void sys_mbox_free(sys_mbox_t *mbox)
+     if (magic != MBOX_MAGIC)
+         return;
+ 
+-    if (index > MBOX_NUMBER)
++    if (index >= MBOX_NUMBER)
+         return;
+ 
+     int oldIME = enterCriticalSection();
+diff --git a/source/common/wifi_shared.h b/source/common/wifi_shared.h
+index af95412..c94d123 100644
+--- a/source/common/wifi_shared.h
++++ b/source/common/wifi_shared.h
+@@ -13,7 +13,7 @@
+ #include <dswifi_common.h>
+ 
+ // Space reserved for incoming and outgoing packets
+-#define WIFI_RXBUFFER_SIZE  (1024 * 12)
++#define WIFI_RXBUFFER_SIZE  (1024 * 64)
+ #define WIFI_TXBUFFER_SIZE  (1024 * 24)
+ 
+ // Value written in RX/TX buffers to restart the pointer to the beginning
