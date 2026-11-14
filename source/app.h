@@ -5,7 +5,7 @@
 #include <stdbool.h>
 #include <nds.h>
 
-#define APP_VERSION "1.0.0-beta.3"
+#define APP_VERSION "1.0.0-beta.4"
 #define APP_AUTHOR  "nuraghex"   // GitHub account, shown on the top screen
 
 #define CFG_DIR   "sd:/_nds/dsiftp"
